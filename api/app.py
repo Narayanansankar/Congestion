@@ -1,4 +1,4 @@
-# === FILE: app.py ===
+# === FILE: api/app.py ===
 from flask import Flask, render_template, request
 import pandas as pd
 import plotly.graph_objs as go
@@ -178,5 +178,5 @@ def dashboard():
     graphs, last_updated = process_data(date_filter)
     return render_template("dashboard.html", graphs=graphs, last_updated=last_updated, selected_date=date_filter)
 
-if __name__ == "__main__":
-    app.run(debug=True)
+# Required for Vercel deployment
+handler = app
