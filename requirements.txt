@@ -1,3 +1,7 @@
+# Tool to reduce the size of other packages
+pip-slim
+
+# Application dependencies
 Flask==2.2.3
 pandas==1.5.3
 plotly==5.14.1
