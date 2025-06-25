@@ -1,7 +1,7 @@
-Flask
-pandas
-plotly
-openpyxl
-google-api-python-client
-google-auth-oauthlib
-google-auth-httplib2
+Flask==2.2.3
+pandas==1.5.3
+plotly==5.14.1
+openpyxl==3.1.2
+google-api-python-client==2.86.0
+google-auth-oauthlib==1.0.0
+google-auth-httplib2==0.1.0
