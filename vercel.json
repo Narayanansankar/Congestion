@@ -1,17 +1,7 @@
 {
-  "builds": [
-    {
-      "src": "app.py",
-      "use": "vercel-python-essentials@2.0.0",
-      "config": {
-        "maxDuration": 45
-      }
+  "functions": {
+    "app.py": {
+      "maxDuration": 45
     }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "app.py"
-    }
-  ]
+  }
 }
