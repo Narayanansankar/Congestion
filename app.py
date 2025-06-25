@@ -4,10 +4,11 @@ import pandas as pd
 import plotly.graph_objs as go
 import plotly.io as pio
 import os
-import io # Used to handle in-memory file
+import io  # Used to handle in-memory file data
 import json
 from datetime import datetime
 
+# Google API Libraries for server-side authentication
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -15,9 +16,14 @@ from googleapiclient.http import MediaIoBaseDownload
 
 app = Flask(__name__)
 
+# === CONFIGURATION (Loaded from Vercel Environment Variables) ===
+# The ID of the Google Drive folder where your ANPR files are stored.
 GDRIVE_FOLDER_ID = os.environ.get('GDRIVE_FOLDER_ID')
+
+# The entire content of your Service Account JSON key file.
 GOOGLE_CREDENTIALS_JSON = os.environ.get('GOOGLE_CREDENTIALS_JSON')
 
+# --- Static Application Config ---
 ROUTES = [
     ("SEITHUNGANALLUR", "ARUMUGANERI", 50),
     ("KURUKKUSALAI", "ARUMUGANERI", 70)
@@ -27,7 +33,7 @@ MODERATE_CONGESTION_OFFSET = 30
 HEAVY_CONGESTION_OFFSET = 60
 
 def get_gdrive_service():
-    """Authenticates with Google Drive API using a Service Account."""
+    """Authenticates with Google Drive API using a Service Account and returns a service object."""
     if not GOOGLE_CREDENTIALS_JSON:
         raise ValueError("The GOOGLE_CREDENTIALS_JSON environment variable is not set.")
     
@@ -46,6 +52,7 @@ def get_latest_file_from_gdrive(service):
         raise ValueError("The GDRIVE_FOLDER_ID environment variable is not set.")
         
     try:
+        # Query to find the latest modified Excel file in the specified folder
         query = (
             f"'{GDRIVE_FOLDER_ID}' in parents and "
             "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "
@@ -60,14 +67,13 @@ def get_latest_file_from_gdrive(service):
         
         items = results.get('files', [])
         if not items:
-            return None, None, None # No file found
+            return None, None, None  # No file found
         
         latest_file = items[0]
         return latest_file['id'], latest_file['name'], latest_file['modifiedTime']
     except HttpError as error:
-        print(f"An error occurred: {error}")
+        print(f"An API error occurred: {error}")
         return None, None, None
-
 
 def download_file_from_gdrive(service, file_id):
     """Downloads a file from GDrive into an in-memory bytes buffer."""
@@ -78,35 +84,35 @@ def download_file_from_gdrive(service, file_id):
         done = False
         while done is False:
             status, done = downloader.next_chunk()
-            print(f"Download {int(status.progress() * 100)}%.")
+            # Optional: Add logging for download progress if needed
         
-        file_buffer.seek(0) # Rewind the buffer to the beginning
+        file_buffer.seek(0)  # Rewind buffer to the beginning before reading
         return file_buffer
     except HttpError as error:
-        print(f"An error occurred during download: {error}")
+        print(f"An error occurred during file download: {error}")
         return None
 
-
 def process_data(date_filter=None):
+    """Main data processing function for a single request."""
     try:
         service = get_gdrive_service()
         file_id, file_name, last_updated_str = get_latest_file_from_gdrive(service)
 
         if not file_id:
-            return ["<p style='color:red;'>No processed Excel file found in Google Drive folder.</p>"], "Not available"
+            return ["<p style='color:red;'>No processed Excel file found in the configured Google Drive folder.</p>"], "Not available"
 
         file_buffer = download_file_from_gdrive(service, file_id)
         if not file_buffer:
             return [f"<p>Error downloading file '{file_name}' from Google Drive.</p>"], "Not available"
 
-        df = pd.read_excel(file_buffer)
+        df = pd.read_excel(file_buffer, engine='openpyxl')
         last_updated = pd.to_datetime(last_updated_str).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     except Exception as e:
-        # Catch errors from authentication, API calls, or pandas
-        return [f"<p style='color:red;'>An error occurred: {e}</p>"], "Not available"
+        # Catch any error during the setup/download phase
+        return [f"<p style='color:red;'>An application error occurred: {e}</p>"], "Not available"
 
-    # --- The rest of your data processing logic is largely the same ---
+    # --- Data Cleaning and Transformation (Same as before) ---
     df["Device Name"] = df["Device Name"].str.upper().str.replace(" C.POST", "", regex=False).str.strip()
     df["License Plate"] = df["License Plate"].str.upper().str.strip()
     df["Passing Time"] = pd.to_datetime(df["Passing Time"], errors='coerce')
@@ -117,28 +123,33 @@ def process_data(date_filter=None):
     
     route_graphs = []
 
+    # --- Graph Generation Loop (Same as before) ---
     for start_cp, end_cp, google_time in ROUTES:
         df_start = df[df["Device Name"] == start_cp]
         df_end = df[df["Device Name"] == end_cp]
         merged = pd.merge(df_start, df_end, on="License Plate", suffixes=("_start", "_end"))
         merged["Travel Time (mins)"] = (merged["Passing Time_end"] - merged["Passing Time_start"]).dt.total_seconds() / 60
         merged = merged[merged["Travel Time (mins)"] > 0]
+        
         if merged.empty:
             continue
+            
         merged["Time Interval"] = merged["Passing Time_start"].dt.floor("15min")
         report = merged.groupby("Time Interval").agg(
             avg_travel_time=('Travel Time (mins)', 'mean'),
             vehicle_count=('License Plate', 'count')
         ).reset_index()
 
+        # --- Plotly Figure Creation (Same as before) ---
         fig = go.Figure()
-        # (The rest of your plotting logic remains identical here)
         moderate_level = google_time + MODERATE_CONGESTION_OFFSET
         heavy_level = google_time + HEAVY_CONGESTION_OFFSET
         max_y_val = report["avg_travel_time"].max() if not report.empty else heavy_level
         graph_top = max(heavy_level + 20, max_y_val * 1.1)
+
         fig.add_hrect(y0=moderate_level, y1=heavy_level, fillcolor="yellow", opacity=0.2, layer="below", line_width=0)
         fig.add_hrect(y0=heavy_level, y1=graph_top, fillcolor="red", opacity=0.2, layer="below", line_width=0)
+
         fig.add_trace(go.Scatter(
             x=report["Time Interval"],
             y=report["avg_travel_time"],
@@ -147,17 +158,32 @@ def process_data(date_filter=None):
             customdata=report[['vehicle_count']],
             hovertemplate="<b>Time</b>: %{x|%H:%M}<br><b>Avg Travel Time</b>: %{y:.1f} mins<br><b>Vehicles Reached</b>: %{customdata[0]}<extra></extra>"
         ))
-        fig.update_layout(title=f"Avg Travel Time: {start_cp} → {end_cp}", xaxis_title="Time", yaxis_title="Travel Time (mins)", height=450, yaxis_range=[0, graph_top])
+        
+        # Add reference lines (Google Avg, Thresholds etc.)
+        fig.add_trace(go.Scatter(x=report["Time Interval"], y=[google_time] * len(report), mode='lines', name=f"Google Avg: {google_time} mins", line=dict(color='green', dash='dash')))
+        fig.add_trace(go.Scatter(x=report["Time Interval"], y=[moderate_level] * len(report), mode='lines', name=f"Moderate Threshold", line=dict(color='orange', dash='dash')))
+        fig.add_trace(go.Scatter(x=report["Time Interval"], y=[heavy_level] * len(report), mode='lines', name=f"Heavy Threshold", line=dict(color='red', dash='dash')))
+
+        fig.update_layout(
+            title=f"Avg Travel Time: {start_cp} → {end_cp}",
+            xaxis_title="Time",
+            yaxis_title="Travel Time (mins)",
+            height=450,
+            yaxis_range=[0, graph_top],
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
         route_graphs.append(pio.to_html(fig, full_html=False))
 
     if not route_graphs:
         checkpoints = df['Device Name'].unique().tolist()
-        msg = f"<p>No matches found for routes: {ROUTES}.<br>Available checkpoints in '{file_name}': {checkpoints}</p>"
+        msg = f"<p>No matching vehicle trips found for the configured routes in file: '{file_name}'.<br>Available checkpoints: {checkpoints}</p>"
         return [msg], last_updated
 
     return route_graphs, last_updated
+
 @app.route("/")
 def dashboard():
+    """Renders the main dashboard page."""
     date_filter = request.args.get("date")
     graphs, last_updated = process_data(date_filter)
     return render_template("dashboard.html", graphs=graphs, last_updated=last_updated, selected_date=date_filter)
