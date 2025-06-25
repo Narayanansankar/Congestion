@@ -1,0 +1,36 @@
+<!-- === FILE: templates/dashboard.html === -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="60">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ANPR Congestion Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #333; }
+        form { margin-bottom: 20px; }
+        .chart-container { margin-bottom: 40px; border: 1px solid #ccc; padding: 10px; border-radius: 8px; }
+        .last-updated { color: #666; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <h1>Vehicle Travel Time Analysis</h1>
+
+    {% if last_updated %}
+        <p class="last-updated"><strong>Last Updated:</strong> {{ last_updated }}</p>
+    {% endif %}
+
+    <form method="get">
+        <label for="date">Filter by Date:</label>
+        <input type="date" id="date" name="date" value="{{ selected_date }}">
+        <button type="submit">Apply</button>
+    </form>
+
+    {% for graph in graphs %}
+        <div class="chart-container">
+            {{ graph | safe }}
+        </div>
+    {% endfor %}
+</body>
+</html>
