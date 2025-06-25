@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder='../templates')
 
 # === CONFIGURATION (Loaded from Vercel Environment Variables) ===
 # The ID of the Google Drive folder where your ANPR files are stored.
