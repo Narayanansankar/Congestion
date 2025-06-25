@@ -1,0 +1,7 @@
+Flask
+pandas
+plotly
+openpyxl
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
