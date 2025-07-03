@@ -26,6 +26,7 @@ ROUTES = [
 MODERATE_CONGESTION_OFFSET = 30
 HEAVY_CONGESTION_OFFSET = 60
 MAX_TRAVEL_TIME_MINS = 4 * 60 # 4 hours
+REQUIRED_COLUMNS = ["Device Name", "License Plate", "Passing Time"]
 
 def get_gdrive_service():
     if not GOOGLE_CREDENTIALS_JSON:
@@ -38,22 +39,13 @@ def get_gdrive_service():
     return build('drive', 'v3', credentials=creds)
 
 def _extract_file_number(filename):
-    """Helper to extract the number from 'anpr_data_*.xlsx' for sorting."""
     try:
-        # e.g., 'anpr_data_123.xlsx' -> '123.xlsx' -> '123'
         number_str = filename.split('_')[-1].split('.')[0]
         return int(number_str)
     except (ValueError, IndexError):
-        # If the filename doesn't match the pattern, treat it as lowest priority
         return -1
 
 def get_latest_file_for_date(service, target_date: date):
-    """
-    Gets the correct file for a date.
-    1. Filters files by modifiedTime for the target date.
-    2. Sorts the results by the number in the filename (anpr_data_*.xlsx).
-    3. Returns the file with the highest number.
-    """
     if not GDRIVE_FOLDER_ID:
         raise ValueError("The GDRIVE_FOLDER_ID environment variable is not set.")
 
@@ -69,10 +61,9 @@ def get_latest_file_for_date(service, target_date: date):
             "trashed=false and "
             f"modifiedTime >= '{start_of_day_iso}' and modifiedTime < '{end_of_day_iso}'"
         )
-        # Get all files for the day, as we will sort them ourselves
         results = service.files().list(
             q=query,
-            pageSize=200, # More than enough for one day's files
+            pageSize=200,
             fields="files(id, name, modifiedTime)"
         ).execute()
 
@@ -80,13 +71,10 @@ def get_latest_file_for_date(service, target_date: date):
         if not files_for_day:
             return None, None, None
 
-        # Sort the files based on the number in the filename, descending
         sorted_files = sorted(files_for_day, key=lambda f: _extract_file_number(f['name']), reverse=True)
         
-        # The best file is the first one in the sorted list
         latest_file = sorted_files[0]
         
-        # Final check to ensure the top file actually matches our pattern
         if _extract_file_number(latest_file['name']) == -1:
             print(f"No files with the pattern 'anpr_data_*.xlsx' found for {target_date}")
             return None, None, None
@@ -133,15 +121,27 @@ def process_data(date_filter_str=None):
         df = pd.read_excel(file_buffer)
         last_updated = pd.to_datetime(last_updated_str).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+        missing_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+        if missing_columns:
+            found_columns = ', '.join(df.columns.tolist()) if not df.columns.empty else 'None'
+            error_message = (
+                f"<p style='color:red; font-family: monospace;'>"
+                f"<strong>File Error:</strong> The file '{file_name}' has incorrect headers.<br>"
+                f"<strong>Missing Columns:</strong> {', '.join(missing_columns)}<br>"
+                f"<strong>Columns Found:</strong> {found_columns}<br>"
+                f"Please check the file and ensure the column names match exactly: "
+                f"'Device Name', 'License Plate', 'Passing Time'."
+                f"</p>"
+            )
+            return [error_message], last_updated
+
     except Exception as e:
         return [f"<p style='color:red;'>An error occurred: {e}</p>"], "Not available"
 
-    # --- Start of processing logic (applied to the single, correct file) ---
     df["Device Name"] = df["Device Name"].str.upper().str.replace(" C.POST", "", regex=False).str.strip()
     df["License Plate"] = df["License Plate"].str.upper().str.strip()
     df["Passing Time"] = pd.to_datetime(df["Passing Time"], errors='coerce')
-    df = df.dropna(subset=["Passing Time", "License Plate", "Device Name"])
-    
+    df = df.dropna(subset=REQUIRED_COLUMNS)
     df = df[df["Passing Time"].dt.date == target_date]
     
     if df.empty:
@@ -150,45 +150,61 @@ def process_data(date_filter_str=None):
     route_graphs = []
 
     for start_cp, end_cp, google_time in ROUTES:
+        # --- Data Prep for this specific route ---
         df_start = df[df["Device Name"] == start_cp]
         df_end = df[df["Device Name"] == end_cp]
+
+        # --- Graph 1: Average Travel Time (from completed trips) ---
         merged = pd.merge(df_start, df_end, on="License Plate", suffixes=("_start", "_end"))
         merged["Travel Time (mins)"] = (merged["Passing Time_end"] - merged["Passing Time_start"]).dt.total_seconds() / 60
         merged = merged[(merged["Travel Time (mins)"] > 0) & (merged["Travel Time (mins)"] <= MAX_TRAVEL_TIME_MINS)]
         
-        if merged.empty:
-            continue
+        travel_time_html = ""
+        if not merged.empty:
+            merged["Time Interval"] = merged["Passing Time_start"].dt.floor("15min")
+            report = merged.groupby("Time Interval").agg(
+                avg_travel_time=('Travel Time (mins)', 'mean'),
+                vehicle_count=('License Plate', 'count')
+            ).reset_index()
+
+            fig_travel = go.Figure()
+            moderate_level = google_time + MODERATE_CONGESTION_OFFSET
+            heavy_level = google_time + HEAVY_CONGESTION_OFFSET
+            max_y_val = report["avg_travel_time"].max()
+            graph_top = max(heavy_level + 20, max_y_val * 1.1)
+
+            fig_travel.add_hrect(y0=moderate_level, y1=heavy_level, fillcolor="yellow", opacity=0.2, layer="below", line_width=0)
+            fig_travel.add_hrect(y0=heavy_level, y1=graph_top, fillcolor="red", opacity=0.2, layer="below", line_width=0)
+
+            fig_travel.add_trace(go.Scatter(x=report["Time Interval"], y=report["avg_travel_time"], mode='lines+markers', name="Actual Avg Travel Time", customdata=report[['vehicle_count']], hovertemplate="<b>Time</b>: %{x|%H:%M}<br><b>Avg Travel Time</b>: %{y:.1f} mins<br><b>Vehicles Reached</b>: %{customdata[0]}<extra></extra>"))
+            fig_travel.add_trace(go.Scatter(x=report["Time Interval"], y=[google_time] * len(report), mode='lines', name=f"Google Avg: {google_time} mins", line=dict(color='green', dash='dash')))
+            fig_travel.add_trace(go.Scatter(x=report["Time Interval"], y=[moderate_level] * len(report), mode='lines', name=f"Moderate Threshold (+{MODERATE_CONGESTION_OFFSET} mins)", line=dict(color='orange', dash='dash')))
+            fig_travel.add_trace(go.Scatter(x=report["Time Interval"], y=[heavy_level] * len(report), mode='lines', name=f"Heavy Threshold (+{HEAVY_CONGESTION_OFFSET} mins)", line=dict(color='red', dash='dash')))
+            fig_travel.update_layout(title=f"Avg Travel Time: {start_cp} → {end_cp}", xaxis_title="Time (Trip Start)", yaxis_title="Travel Time (mins)", height=450, yaxis_range=[0, graph_top])
+            travel_time_html = pio.to_html(fig_travel, full_html=False)
+        else:
+            travel_time_html = f"<h3>Avg Travel Time: {start_cp} → {end_cp}</h3><p>No vehicles completed this journey within {int(MAX_TRAVEL_TIME_MINS/60)} hours on the selected date.</p>"
+
+        # --- Graph 2: Vehicle Volume at Start Point ---
+        volume_html = ""
+        if not df_start.empty:
+            df_start_volume = df_start.copy()
+            df_start_volume['Time Interval'] = df_start_volume['Passing Time'].dt.floor('15min')
+            volume_report = df_start_volume.groupby('Time Interval').agg(vehicle_count=('License Plate', 'nunique')).reset_index()
             
-        merged["Time Interval"] = merged["Passing Time_start"].dt.floor("15min")
-        report = merged.groupby("Time Interval").agg(
-            avg_travel_time=('Travel Time (mins)', 'mean'),
-            vehicle_count=('License Plate', 'count')
-        ).reset_index()
+            fig_volume = go.Figure()
+            fig_volume.add_trace(go.Bar(x=volume_report['Time Interval'], y=volume_report['vehicle_count'], name='Vehicle Count', hovertemplate="<b>Time</b>: %{x|%H:%M}<br><b>Vehicles Started</b>: %{y}<extra></extra>"))
+            fig_volume.update_layout(title=f"Vehicle Volume at Start Point: {start_cp}", xaxis_title="Time (15 min intervals)", yaxis_title="Number of Vehicles", height=400, bargap=0.2)
+            volume_html = pio.to_html(fig_volume, full_html=False)
+        else:
+            volume_html = f"<h3>Vehicle Volume at Start Point: {start_cp}</h3><p>No vehicles detected at this start point on the selected date.</p>"
 
-        fig = go.Figure()
-        moderate_level = google_time + MODERATE_CONGESTION_OFFSET
-        heavy_level = google_time + HEAVY_CONGESTION_OFFSET
-        max_y_val = report["avg_travel_time"].max() if not report.empty else heavy_level
-        graph_top = max(heavy_level + 20, max_y_val * 1.1)
-
-        fig.add_hrect(y0=moderate_level, y1=heavy_level, fillcolor="yellow", opacity=0.2, layer="below", line_width=0)
-        fig.add_hrect(y0=heavy_level, y1=graph_top, fillcolor="red", opacity=0.2, layer="below", line_width=0)
-
-        fig.add_trace(go.Scatter(
-            x=report["Time Interval"], y=report["avg_travel_time"], mode='lines+markers', name="Actual Avg Travel Time",
-            customdata=report[['vehicle_count']],
-            hovertemplate="<b>Time</b>: %{x|%H:%M}<br><b>Avg Travel Time</b>: %{y:.1f} mins<br><b>Vehicles Reached</b>: %{customdata[0]}<extra></extra>"
-        ))
-        fig.add_trace(go.Scatter(x=report["Time Interval"], y=[google_time] * len(report), mode='lines', name=f"Google Avg: {google_time} mins", line=dict(color='green', dash='dash')))
-        fig.add_trace(go.Scatter(x=report["Time Interval"], y=[moderate_level] * len(report), mode='lines', name=f"Moderate Threshold (+{MODERATE_CONGESTION_OFFSET} mins)", line=dict(color='orange', dash='dash')))
-        fig.add_trace(go.Scatter(x=report["Time Interval"], y=[heavy_level] * len(report), mode='lines', name=f"Heavy Threshold (+{HEAVY_CONGESTION_OFFSET} mins)", line=dict(color='red', dash='dash')))
-
-        fig.update_layout(title=f"Avg Travel Time: {start_cp} → {end_cp}", xaxis_title="Time", yaxis_title="Travel Time (mins)", height=450, yaxis_range=[0, graph_top])
-        route_graphs.append(pio.to_html(fig, full_html=False))
+        # --- Combine both graphs for this route and add a separator ---
+        route_graphs.append(travel_time_html + volume_html + "<hr>")
 
     if not route_graphs:
-        checkpoints = df['Device Name'].unique().tolist() if not df.empty else []
-        msg = f"<p>No journey matches found for the defined routes on {target_date.strftime('%Y-%m-%d')}.<br>Available checkpoints in the data for this day: {checkpoints}</p>"
+        checkpoints = df['Device Name'].unique().tolist()
+        msg = f"<p>No data found for any routes on {target_date.strftime('%Y-%m-%d')}.<br>Available checkpoints in the data for this day: {checkpoints}</p>"
         return [msg], last_updated
 
     return route_graphs, last_updated
