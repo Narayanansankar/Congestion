@@ -37,15 +37,28 @@ def get_gdrive_service():
     )
     return build('drive', 'v3', credentials=creds)
 
-def get_files_for_date(service, target_date: date):
-    """Gets all Excel files from G-Drive modified on a specific date."""
+def _extract_file_number(filename):
+    """Helper to extract the number from 'anpr_data_*.xlsx' for sorting."""
+    try:
+        # e.g., 'anpr_data_123.xlsx' -> '123.xlsx' -> '123'
+        number_str = filename.split('_')[-1].split('.')[0]
+        return int(number_str)
+    except (ValueError, IndexError):
+        # If the filename doesn't match the pattern, treat it as lowest priority
+        return -1
+
+def get_latest_file_for_date(service, target_date: date):
+    """
+    Gets the correct file for a date.
+    1. Filters files by modifiedTime for the target date.
+    2. Sorts the results by the number in the filename (anpr_data_*.xlsx).
+    3. Returns the file with the highest number.
+    """
     if not GDRIVE_FOLDER_ID:
         raise ValueError("The GDRIVE_FOLDER_ID environment variable is not set.")
 
-    # Construct a date range for the query in UTC
     start_of_day = datetime(target_date.year, target_date.month, target_date.day, tzinfo=timezone.utc)
     end_of_day = start_of_day + timedelta(days=1)
-    
     start_of_day_iso = start_of_day.isoformat()
     end_of_day_iso = end_of_day.isoformat()
 
@@ -56,17 +69,32 @@ def get_files_for_date(service, target_date: date):
             "trashed=false and "
             f"modifiedTime >= '{start_of_day_iso}' and modifiedTime < '{end_of_day_iso}'"
         )
+        # Get all files for the day, as we will sort them ourselves
         results = service.files().list(
             q=query,
-            pageSize=150,  # Get all potential files for a day (24*4 = 96)
-            fields="files(id, name, modifiedTime)",
-            orderBy="modifiedTime asc"  # Process files in chronological order
+            pageSize=200, # More than enough for one day's files
+            fields="files(id, name, modifiedTime)"
         ).execute()
 
-        return results.get('files', [])
+        files_for_day = results.get('files', [])
+        if not files_for_day:
+            return None, None, None
+
+        # Sort the files based on the number in the filename, descending
+        sorted_files = sorted(files_for_day, key=lambda f: _extract_file_number(f['name']), reverse=True)
+        
+        # The best file is the first one in the sorted list
+        latest_file = sorted_files[0]
+        
+        # Final check to ensure the top file actually matches our pattern
+        if _extract_file_number(latest_file['name']) == -1:
+            print(f"No files with the pattern 'anpr_data_*.xlsx' found for {target_date}")
+            return None, None, None
+
+        return latest_file['id'], latest_file['name'], latest_file['modifiedTime']
     except HttpError as error:
-        print(f"An error occurred while listing files: {error}")
-        return []
+        print(f"An error occurred while finding the latest file: {error}")
+        return None, None, None
 
 def download_file_from_gdrive(service, file_id):
     try:
@@ -76,7 +104,6 @@ def download_file_from_gdrive(service, file_id):
         done = False
         while not done:
             status, done = downloader.next_chunk()
-            # print(f"Download {int(status.progress() * 100)}%.") # Commented out for cleaner logs
         file_buffer.seek(0)
         return file_buffer
     except HttpError as error:
@@ -84,53 +111,41 @@ def download_file_from_gdrive(service, file_id):
         return None
 
 def process_data(date_filter_str=None):
-    # Determine the target date for data fetching
     if date_filter_str:
-        target_date = pd.to_datetime(date_filter_str).date()
+        try:
+            target_date = pd.to_datetime(date_filter_str).date()
+        except ValueError:
+             return [f"<p style='color:red;'>Invalid date format: '{date_filter_str}'. Please use YYYY-MM-DD.</p>"], "Not available"
     else:
-        # Default to the current date in UTC
         target_date = datetime.now(timezone.utc).date()
 
     try:
         service = get_gdrive_service()
-        files_for_day = get_files_for_date(service, target_date)
+        file_id, file_name, last_updated_str = get_latest_file_for_date(service, target_date)
 
-        if not files_for_day:
-            return [f"<p>No data files found for {target_date.strftime('%Y-%m-%d')}.</p>"], "Not available"
+        if not file_id:
+            return [f"<p>No data file found for {target_date.strftime('%Y-%m-%d')}.</p>"], "Not available"
 
-        last_updated_str = files_for_day[-1]['modifiedTime']
+        file_buffer = download_file_from_gdrive(service, file_id)
+        if not file_buffer:
+            return [f"<p>Error downloading file '{file_name}' from Google Drive.</p>"], "Not available"
 
-        all_dfs = []
-        for file_info in files_for_day:
-            file_buffer = download_file_from_gdrive(service, file_info['id'])
-            if file_buffer:
-                try:
-                    temp_df = pd.read_excel(file_buffer)
-                    all_dfs.append(temp_df)
-                except Exception as e:
-                    print(f"Could not read file {file_info['name']}: {e}")
-
-        if not all_dfs:
-            return [f"<p>Found files for {target_date.strftime('%Y-%m-%d')}, but could not read their contents.</p>"], "Not available"
-
-        # Combine data from all files for the day into one DataFrame
-        df = pd.concat(all_dfs, ignore_index=True)
-        # Remove duplicate rows that might exist from file overlaps
-        df.drop_duplicates(inplace=True)
-
+        df = pd.read_excel(file_buffer)
         last_updated = pd.to_datetime(last_updated_str).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     except Exception as e:
         return [f"<p style='color:red;'>An error occurred: {e}</p>"], "Not available"
 
-    # --- Start of existing processing logic on the combined DataFrame ---
+    # --- Start of processing logic (applied to the single, correct file) ---
     df["Device Name"] = df["Device Name"].str.upper().str.replace(" C.POST", "", regex=False).str.strip()
     df["License Plate"] = df["License Plate"].str.upper().str.strip()
     df["Passing Time"] = pd.to_datetime(df["Passing Time"], errors='coerce')
     df = df.dropna(subset=["Passing Time", "License Plate", "Device Name"])
-
-    # Filter data to only include records from the target date as a sanity check
+    
     df = df[df["Passing Time"].dt.date == target_date]
+    
+    if df.empty:
+        return [f"<p>The file for {target_date.strftime('%Y-%m-%d')} ('{file_name}') was found but contained no valid data for that date.</p>"], last_updated
 
     route_graphs = []
 
